@@ -42,6 +42,9 @@
 #include "beam-id.h"
 
 #include "bwp-manager-gnb.h"
+#include "a-packet-tags.h"
+#include <numeric>  // std::accumulate를 사용하기 위해 필요
+#include <queue>
 
 namespace ns3 {
 NS_LOG_COMPONENT_DEFINE ("NrGnbMac");
@@ -53,6 +56,13 @@ NS_OBJECT_ENSURE_REGISTERED (NrGnbMac);
 // //////////////////////////////////////
 // member SAP forwarders
 // //////////////////////////////////////
+
+std::unordered_map<uint16_t, uint64_t> m_패킷생성시간;                    // RNTI별 패킷 생성 시간 저장(RNTI, 패킷 생성 시간)
+std::unordered_map<uint16_t, uint64_t> m_패킷받은시간;                    // RNTI별 패킷 받은 시간 저장(RNTI, 패킷 받은 시간)
+std::unordered_map<uint16_t, uint16_t> m_패킷우선순위;                    // RNTI별 패킷 우선순위 저장(RNTI, 패킷 우선순위)
+std::unordered_map<uint16_t, std::queue<NrGnbMac::AgeEntry>> m_AgeQueues; // RNTI별 받은 시간과 Age 쌍을 순서대로 보관하는 큐(RNTI, 우선순위위, Age, count)
+std::vector<uint64_t> m_AoI;                                              // 스케줄링된 Age 값을 저장하는 벡터
+std::map<uint16_t, uint64_t> rntiToTotalBytes;                            // RNTI 별 총 패킷 크기를 저장하는 맵
 
 
 class NrGnbMacMemberEnbCmacSapProvider : public LteEnbCmacSapProvider
@@ -78,6 +88,74 @@ private:
 NrGnbMacMemberEnbCmacSapProvider::NrGnbMacMemberEnbCmacSapProvider (NrGnbMac* mac)
   : m_mac (mac)
 {
+}
+
+// 시뮬레이션 시작 시 PeriodicAgeUpdate()를 시작하는 함수
+void
+NrGnbMac::StartPeriodicAgeUpdate(uint16_t TTI, uint32_t deadline){
+  NS_LOG_INFO("Starting periodic Age update every 100ns");
+  PeriodicAgeUpdate(TTI, deadline);
+}
+
+// n(µs)마다 호출될 주기적 Age 관리 함수
+void
+NrGnbMac::PeriodicAgeUpdate(uint16_t updateTTI, uint32_t deadline) {
+  NS_LOG_FUNCTION(this);
+  for (auto& entry : m_AgeQueues) {
+    IncrementAgeOnNoPacket(entry.first, deadline);  // 예시: Deadline 100ms
+  }
+  // updateTTI 마다 호출 (반복 스케줄링)
+  Simulator::Schedule(NanoSeconds(updateTTI), &NrGnbMac::PeriodicAgeUpdate, this, updateTTI, deadline);
+}
+
+// 주기적 Age 증가 로직 (TTI마다 호출)
+void
+NrGnbMac::IncrementAgeOnNoPacket(uint16_t rnti, uint32_t deadline) {
+  // 패킷을 받지 않은 UE만 Age 증가
+  if (m_패킷받은시간.find(rnti) == m_패킷받은시간.end()) {
+    auto& ageQueue = m_AgeQueues[rnti];
+
+    if (!ageQueue.empty()) {
+      AgeEntry& 안받은 = ageQueue.back();
+      안받은.age++;
+
+      // deadline 넘으면, Age를 1로 초기화
+      if (안받은.age >= deadline) {
+        안받은.age = 1;
+      }
+    }
+  }
+  else {
+    // 패킷을 받은 UE는 m_AgeQueue에 저장된 우선순위를 기반하여 계산
+    auto& ageQueue = m_AgeQueues[rnti];
+    if (!ageQueue.empty()) {
+      // 저장된 우선순위 가져오기
+      AgeEntry& 받은 = ageQueue.back();
+      uint32_t w = 받은.priority * 받은.count;
+      
+      받은.age += w;
+      받은.count += 1;
+      
+      // deadline 넘으면, Age를 1로 초기화
+      // if (받은.age >= deadline) {
+      //   받은.age   = 1;
+      //   받은.count = 1;
+      // }
+      // NS_LOG_INFO("UE : " << rnti << "\t Age : " << 받은.age << "\t AgeUpdate/100µs");
+    }
+  }
+}
+
+// 패킷 처리 시 Age 초기화 및 패킷 수신 여부 초기화
+void
+NrGnbMac::ResetAgeOnPacketProcessed(uint16_t rnti) {
+  if (m_AgeQueues.find(rnti) != m_AgeQueues.end()) {
+    auto& ageQueue = m_AgeQueues[rnti];
+    while (!ageQueue.empty()) {
+      ageQueue.pop(); // 처리 완료 후 제거
+    }
+  }
+  m_패킷받은시간.erase(rnti); // 수신 정보 초기화
 }
 
 void
@@ -659,121 +737,124 @@ NrGnbMac::DoSlotDlIndication (const SfnSf &sfnSf, LteNrTddSlotType type)
 }
 
 void
-NrGnbMac::DoSlotUlIndication (const SfnSf &sfnSf, LteNrTddSlotType type)
-{
+NrGnbMac::DoSlotUlIndication (const SfnSf &sfnSf, LteNrTddSlotType type) {
   NS_LOG_FUNCTION (this);
-  NS_LOG_INFO ("Perform things on UL, slot on the air: " << sfnSf);
+  // NS_LOG_INFO ("Perform things on UL, slot on the air: " << sfnSf);
 
-  // --- UPLINK ---
-  // Send UL-CQI info to the scheduler
-  for (uint16_t i = 0; i < m_ulCqiReceived.size (); i++)
-    {
-      //m_ulCqiReceived.at (i).m_sfnSf = ((0x3FF & frameNum) << 16) | ((0xFF & subframeNum) << 8) | (0xFF & varTtiNum);
-      m_macSchedSapProvider->SchedUlCqiInfoReq (m_ulCqiReceived.at (i));
-    }
+  // --- 상향링크(UPLINK) ---
+  // 스케줄러에 UL-CQI 정보 전송
+  for (uint16_t i = 0; i < m_ulCqiReceived.size (); i++) {
+    //m_ulCqiReceived.at (i).m_sfnSf = ((0x3FF & frameNum) << 16) | ((0xFF & subframeNum) << 8) | (0xFF & varTtiNum);
+    m_macSchedSapProvider->SchedUlCqiInfoReq (m_ulCqiReceived.at (i));
+  }
+
   m_ulCqiReceived.clear ();
 
-  if (m_cgScheduling)
-    {
-      static bool cgr_configuration = false;
-      static SfnSf m_cgr_configuration = SfnSf (0,0,0,sfnSf.GetNumerology ());
-      static uint8_t posCG = 0;
+  if (m_cgScheduling) {
+    static bool cgr_configuration = false;  // CG 설정 상태를 유지하기 위한 static 변수
+    static SfnSf m_cgr_configuration = SfnSf (0,0,0,sfnSf.GetNumerology ());  // 최초 CG 구성 시점을 저장할 변수 (Numerology에 맞추어 초기화)
+    static uint8_t posCG = 0;               // CG 구성 슬롯 후보를 인덱스별로 저장하는 배열 인덱스
 
-      uint8_t numberOfSlot_insideOneSubframe = pow(2,(sfnSf.GetNumerology ()));
+    uint8_t numberOfSlot_insideOneSubframe = pow(2,(sfnSf.GetNumerology ())); // 한 subframe(1 ms) 안에 몇 개의 슬롯이 있는지 계산 (μ=Numerology)
 
-      // Send CGR info to the scheduler in order to allocate resources:
-      if (!cgr_configuration ||  m_currentSlot < m_cgr_configuration)
-        {
-          for (const auto & v : m_srRntiList)
-            {
-              uint8_t number_slots_for_processing_configurationPeriod = 7;
-              uint8_t number_slots_configuration = (m_configurationTime*numberOfSlot_insideOneSubframe)-number_slots_for_processing_configurationPeriod;
-              if(v != 0 )
-                {
-                  if (!cgr_configuration)
-                    {
-                      // We calculate from how many slots on
-                      // the transmissions will be done using only the pre-allocated resources
-                      cgr_configuration = true;
-                      m_cgr_configuration = m_currentSlot;
-                      m_cgr_configuration.Add(number_slots_configuration);
-                      paramsCG_rntiSlot[posCG].m_snfSf = m_cgr_configuration;
-                    }
-                  else
-                    {
-                      posCG ++;
-                      m_cgrNextTxSlot = m_currentSlot;
-                      m_cgrNextTxSlot.Add(number_slots_configuration);
-                      paramsCG_rntiSlot[posCG].m_snfSf = m_cgrNextTxSlot;
-                    }
-                  paramsCG_rntiSlot[posCG].m_srList.insert (paramsCG_rntiSlot[posCG].m_srList.begin(), m_srRntiList.begin (), m_srRntiList.end ());
-                  paramsCG_rntiSlot[posCG].m_bufCgr.insert (paramsCG_rntiSlot[posCG].m_bufCgr.begin(), m_cgrBufSizeList.begin (), m_cgrBufSizeList.end ());
-                  paramsCG_rntiSlot[posCG].m_TraffPCgr.insert (paramsCG_rntiSlot[posCG].m_TraffPCgr.begin(), m_cgrTraffP.begin (), m_cgrTraffP.end ());
-                  paramsCG_rntiSlot[posCG].lcid = lcid_configuredGrant;
-                  paramsCG_rntiSlot[posCG].m_TraffInitCgr.insert (paramsCG_rntiSlot[posCG].m_TraffInitCgr.begin(), m_cgrTraffInit.begin (), m_cgrTraffInit.end ());
-                  paramsCG_rntiSlot[posCG].m_TraffDeadlineCgr.insert (paramsCG_rntiSlot[posCG].m_TraffDeadlineCgr.begin(), m_cgrTraffDeadline.begin (), m_cgrTraffDeadline.end ());
-                  countCG_slots = posCG;
-                  break;
-                }
-            }
+    // Send CGR info to the scheduler in order to allocate resources:
+    if (!cgr_configuration ||  m_currentSlot < m_cgr_configuration) {
+      for (const auto & v : m_srRntiList) {
+        uint8_t number_slots_for_processing_configurationPeriod = 7;
+        uint8_t number_slots_configuration = (m_configurationTime*numberOfSlot_insideOneSubframe)-number_slots_for_processing_configurationPeriod;
+        if(v != 0 ) {
+          if (!cgr_configuration) {
+            // 우리는 미리 할당된 자원만을 사용하여 전송이 얼마나 많은 슬롯에서 이루어질지 계산합니다
+            cgr_configuration = true;
+            m_cgr_configuration = m_currentSlot;
+            m_cgr_configuration.Add(number_slots_configuration);
+            paramsCG_rntiSlot[posCG].m_snfSf = m_cgr_configuration;
+          }
+          else {
+            posCG ++;
+            m_cgrNextTxSlot = m_currentSlot;
+            m_cgrNextTxSlot.Add(number_slots_configuration);
+            paramsCG_rntiSlot[posCG].m_snfSf = m_cgrNextTxSlot;
+          }
+          paramsCG_rntiSlot[posCG].m_srList.insert (paramsCG_rntiSlot[posCG].m_srList.begin(), m_srRntiList.begin (), m_srRntiList.end ());
+          paramsCG_rntiSlot[posCG].m_bufCgr.insert (paramsCG_rntiSlot[posCG].m_bufCgr.begin(), m_cgrBufSizeList.begin (), m_cgrBufSizeList.end ());
+          paramsCG_rntiSlot[posCG].m_TraffPCgr.insert (paramsCG_rntiSlot[posCG].m_TraffPCgr.begin(), m_cgrTraffP.begin (), m_cgrTraffP.end ());
+          paramsCG_rntiSlot[posCG].lcid = lcid_configuredGrant;
+          paramsCG_rntiSlot[posCG].m_TraffInitCgr.insert (paramsCG_rntiSlot[posCG].m_TraffInitCgr.begin(), m_cgrTraffInit.begin (), m_cgrTraffInit.end ());
+          paramsCG_rntiSlot[posCG].m_TraffDeadlineCgr.insert (paramsCG_rntiSlot[posCG].m_TraffDeadlineCgr.begin(), m_cgrTraffDeadline.begin (), m_cgrTraffDeadline.end ());
+          countCG_slots = posCG;
+          break;
         }
-      else
-       {
-          posCG = 0;
-          while (posCG <= countCG_slots)
-            {
-              if (paramsCG_rntiSlot[posCG].m_snfSf == m_currentSlot)
-               {
-                  auto rntiIt = paramsCG_rntiSlot[posCG].m_srList.begin ();
-                  auto bufIt = paramsCG_rntiSlot[posCG].m_bufCgr.begin ();
-                  auto traffPIt = paramsCG_rntiSlot[posCG].m_TraffPCgr.begin ();
-                  auto traffInitIt = paramsCG_rntiSlot[posCG].m_TraffInitCgr.begin ();
-                  auto traffDeadlineIt = paramsCG_rntiSlot[posCG].m_TraffDeadlineCgr.begin ();
-                  while (rntiIt != paramsCG_rntiSlot[posCG].m_srList.end ())
-                   {
-                      m_ccmMacSapUser->UlReceiveCgr (*rntiIt, componentCarrierId_configuredGrant, *bufIt,lcid_configuredGrant,*traffPIt, *traffInitIt, *traffDeadlineIt);
-                      m_cgrNextTxSlot = m_currentSlot;
-                      uint8_t number_slots_configurateGrantPeriod = *traffPIt*numberOfSlot_insideOneSubframe;
-                      m_cgrNextTxSlot.Add(number_slots_configurateGrantPeriod);
-                      paramsCG_rntiSlot[posCG].m_snfSf = m_cgrNextTxSlot;
-                      rntiIt++;
-                      bufIt++;
-                      traffPIt++;
-                   }
-                 posCG = 0;
-                 break;
-               }
-              posCG ++;
-            }
-       }
+      }
+    }
+    else {  // “이미 구성 완료” 이고 “지금 슬롯이 구성 시점을 지났다면” → “전송 단계”
+      posCG = 0;
+      // 미리 계산해둔 각 CG 전송 시점 슬롯들과 비교
+      while (posCG <= countCG_slots) {
+        if (paramsCG_rntiSlot[posCG].m_snfSf == m_currentSlot) {  // 예약해 둔 슬롯과 지금 슬롯이 딱 일치하면
+          // 그 posCG 에 저장된 UE 리스트만큼 반복
+          auto rntiIt = paramsCG_rntiSlot[posCG].m_srList.begin ();
+          auto bufIt = paramsCG_rntiSlot[posCG].m_bufCgr.begin ();
+          auto traffPIt = paramsCG_rntiSlot[posCG].m_TraffPCgr.begin ();
+          auto traffInitIt = paramsCG_rntiSlot[posCG].m_TraffInitCgr.begin ();
+          auto traffDeadlineIt = paramsCG_rntiSlot[posCG].m_TraffDeadlineCgr.begin ();
 
-      {
-        NrMacSchedSapProvider::SchedUlCgrInfoReqParameters params;
-        params.m_snfSf = m_currentSlot;
-        params.m_srList.insert (params.m_srList.begin(), m_srRntiList.begin (), m_srRntiList.end ());
-        params.m_bufCgr.insert(params.m_bufCgr.begin(), m_cgrBufSizeList.begin (), m_cgrBufSizeList.end ());
-        params.lcid = lcid_configuredGrant;
-        params.m_TraffPCgr.insert (params.m_TraffPCgr.begin(), m_cgrTraffP.begin (), m_cgrTraffP.end ());
-        params.m_TraffInitCgr.insert (params.m_TraffInitCgr.begin(), m_cgrTraffInit.begin (), m_cgrTraffInit.end ());
-        params.m_TraffDeadlineCgr.insert (params.m_TraffDeadlineCgr.begin(), m_cgrTraffDeadline.begin (), m_cgrTraffDeadline.end ());
-        m_srRntiList.clear();
-        m_cgrBufSizeList.clear();
-        m_cgrTraffP.clear();
-        m_cgrTraffDeadline.clear();
-        m_cgrTraffInit.clear();
-
-        m_macSchedSapProvider->SchedUlCgrInfoReq (params);
+          // 모든 UE에 대해 UlReceiverCgr() 호출 -> 실제 UL grant 전달
+          while (rntiIt != paramsCG_rntiSlot[posCG].m_srList.end ()) {  // 실제 gNB→UE 로 CGR 메시지 전송
+            m_ccmMacSapUser->UlReceiveCgr (*rntiIt, componentCarrierId_configuredGrant, *bufIt,lcid_configuredGrant,*traffPIt, *traffInitIt, *traffDeadlineIt);
+            m_cgrNextTxSlot = m_currentSlot;  // “다음 전송 시점” = 지금 + traffP * slotsPerSubframe
+            uint8_t number_slots_configurateGrantPeriod = *traffPIt*numberOfSlot_insideOneSubframe;
+            m_cgrNextTxSlot.Add(number_slots_configurateGrantPeriod);
+            paramsCG_rntiSlot[posCG].m_snfSf = m_cgrNextTxSlot; // 예약 슬롯 업데이트
+            rntiIt++;
+            bufIt++;
+            traffPIt++;
+          }
+            
+          posCG = 0; // 다시 처음부터 검사
+          break;
+        }
+        posCG ++;
+      }
+    }
+    { // 스케줄러에 CGR 정보 요청
+      NrMacSchedSapProvider::SchedUlCgrInfoReqParameters params;
+      params.m_snfSf = m_currentSlot;
+      params.m_srList.insert (params.m_srList.begin(), m_srRntiList.begin (), m_srRntiList.end ());
+      params.m_bufCgr.insert(params.m_bufCgr.begin(), m_cgrBufSizeList.begin (), m_cgrBufSizeList.end ());
+      params.lcid = lcid_configuredGrant;
+      params.m_TraffPCgr.insert (params.m_TraffPCgr.begin(), m_cgrTraffP.begin (), m_cgrTraffP.end ());
+      params.m_TraffInitCgr.insert (params.m_TraffInitCgr.begin(), m_cgrTraffInit.begin (), m_cgrTraffInit.end ());
+      params.m_TraffDeadlineCgr.insert (params.m_TraffDeadlineCgr.begin(), m_cgrTraffDeadline.begin (), m_cgrTraffDeadline.end ());
+      
+      for (const auto & v : m_srRntiList){
+        auto& ageQueue = m_AgeQueues[v];
+        if (!ageQueue.empty()){
+          const AgeEntry &e = ageQueue.front();
+          params.m_ageList.push_back(e.age);
+        }
+        else{
+          params.m_ageList.push_back(1); // Age 정보가 없으면 1로 설정
+        }
       }
 
-      // We do not have to send UL BSR reports to the scheduler because it uses configured grant,
-      // all the resources are allocated.
-      if (m_ulCeReceived.size () > 0)
-        {
-          m_ulCeReceived.erase (m_ulCeReceived.begin (), m_ulCeReceived.end ());
-        }
+      // 일괄 전송 후 리스트 초기화
+      m_srRntiList.clear();
+      m_cgrBufSizeList.clear();
+      m_cgrTraffP.clear();
+      m_cgrTraffDeadline.clear();
+      m_cgrTraffInit.clear();
+
+      m_macSchedSapProvider->SchedUlCgrInfoReq (params);
     }
-  else
-    {
+
+    // We do not have to send UL BSR reports to the scheduler because it uses configured grant,
+    // all the resources are allocated.
+    if (m_ulCeReceived.size () > 0) {
+      m_ulCeReceived.erase (m_ulCeReceived.begin (), m_ulCeReceived.end ());
+    }
+  }
+  else {
       // Send SR info to the scheduler
       {
         NrMacSchedSapProvider::SchedUlSrInfoReqParameters params;
@@ -922,6 +1003,55 @@ NrGnbMac::DoReceivePhyPdu (Ptr<Packet> p)
 
   NS_ASSERT_MSG (rntiIt != m_rlcAttached.end (), "could not find RNTI" << rnti);
 
+  // Age가 가장 처음으로 gNB MAC 계층으로 도착하는 곳
+  PacketCreationTimeTag creationTimeTag;                        // 패킷 생성 시간 태그 확인
+  if (p->RemovePacketTag(creationTimeTag)){
+    uint64_t 생성시간 = creationTimeTag.GetCreationTime();      // 패킷을 생성한 시간을 저장
+    uint64_t 받은시간 = Simulator::Now().GetNanoSeconds();     // gNB가 패킷을 받은 시간을 저장
+
+    m_패킷생성시간[rnti] = 생성시간;                            // 각 패킷의 생성 시간을 rnti(UE)에 매핑하여 저장
+    m_패킷받은시간[rnti] = 받은시간;                            // 각 패킷의 받은 시간을 rnti(UE)에 매핑하여 저장
+
+    if (m_AoIType == false){
+      uint64_t age = 받은시간 - 생성시간;                       // age는 "gNB가 받은 시간 - 패킷 생성 시간"의 차이로 계산
+      
+      PriorityTag PriorityTag;                                  // 패킷 우선 순위 태그 확인
+      if (p->RemovePacketTag(PriorityTag)){
+        uint32_t 우선순위 = PriorityTag.GetPriority();          // 패킷 우선순위를 저장
+        m_패킷우선순위[rnti] = 우선순위;                        // 각 패킷의 우선 순위를 rnti(UE)에 매핑하여 저장
+        age *= 우선순위;
+        NS_LOG_INFO("UE : " << rnti << "\t 우선순위 : " << 우선순위 << "\t Age : " << age << "\t gNB가 수신한 시점");
+        auto &ageQueue = m_AgeQueues[rnti];                     // RNTI가 있으면 대응하는 큐를 꺼내고, 없으면 새로 생성
+        AgeEntry entry;
+        entry.priority = 우선순위;  // 우선순위
+        entry.age      = age;       // 계산된 age
+        entry.count    = 1;         // 새 엔트리의 count는 1로 초기화
+        ageQueue.push(entry);
+      }
+    }
+    else {
+      uint64_t age = 1;                                         // 디폴트 Age 1
+      auto it = m_AgeQueues.find(rnti);
+      if (it != m_AgeQueues.end() && !it->second.empty()) {
+        age = it->second.back().age;
+      }
+      
+      PriorityTag PriorityTag;                                  // 패킷 우선 순위 태그 확인
+      if (p->RemovePacketTag(PriorityTag)){
+        uint32_t 우선순위 = PriorityTag.GetPriority();          // 패킷 우선순위를 저장
+        m_패킷우선순위[rnti] = 우선순위;                        // 각 패킷의 우선 순위를 rnti(UE)에 매핑하여 저장
+
+        NS_LOG_INFO("UE : " << rnti << "\t 우선순위 : " << 우선순위 << "\t Age : " << age << "\t gNB가 수신한 시점");
+        auto &ageQueue = m_AgeQueues[rnti];                     // RNTI가 있으면 대응하는 큐를 꺼내고, 없으면 새로 생성
+        AgeEntry entry;
+        entry.priority = 우선순위;  // 우선순위
+        entry.age      = age;       // 계산된 age
+        entry.count    = 1;         // 새 엔트리의 count는 1로 초기화
+        ageQueue.push(entry);
+      }
+    }
+  }
+
   // Try to peek whatever header; in the first byte there will be the LC ID.
   NrMacHeaderFsUl header;
   p->PeekHeader (header);
@@ -953,16 +1083,66 @@ NrGnbMac::DoReceivePhyPdu (Ptr<Packet> p)
   p->RemoveHeader (macHeader);
 
   auto lcidIt = rntiIt->second.find (macHeader.GetLcId ());
+  
+  // 처리량 계산
+  uint64_t bytes = p->GetSize (); // 패킷 바이트 크기
+  rntiToTotalBytes[rnti] += bytes;
 
   LteMacSapUser::ReceivePduParameters rxParams;
   rxParams.p = p;
   rxParams.lcid = macHeader.GetLcId ();
   rxParams.rnti = rnti;
 
-  if (rxParams.p->GetSize ())
-    {
-      (*lcidIt).second->ReceivePdu (rxParams);
-    }
+  if (rxParams.p->GetSize ()) {
+    (*lcidIt).second->ReceivePdu (rxParams);
+  }
+}
+
+void
+NrGnbMac::PrintAverageThroughput (){
+  std::cout << "----------[RNTI 당 평균 Throughput]----------" << std::endl;
+  
+  double totalThroughput = 0.0;
+  int rntiCount = 0;
+  
+  for (const auto &[rnti, totalBytes] : rntiToTotalBytes){
+    double throughput = (totalBytes * 8.0) / 10.0; // bps
+    std::cout << "RNTI: " << rnti << ", Throughput: " << throughput / 1e3 << " Kbps" << std::endl;
+    totalThroughput += throughput;
+    rntiCount++;
+  }
+  if (rntiCount > 0) {
+    double averageThroughput = totalThroughput / rntiCount;
+    std::cout << "전체 평균 Throughput: " << averageThroughput / 1e3 << " Kbps" << std::endl;}
+  // } else {
+  //   std::cout << "RNTI 데이터가 존재하지 않습니다." << std::endl;
+  // }
+}
+
+void
+NrGnbMac::PrintAverageAoI (){
+  std::cout << "----------[가중 평균 AoI]----------" << std::endl;
+  if (m_AoI.empty ()) {
+    std::cout << "No AoI samples available\n";
+    return;
+  }
+
+  // 평균
+  double sum = std::accumulate(m_AoI.begin(), m_AoI.end(), 0.0);
+  double avg = sum / static_cast<double>(m_AoI.size());
+  std::cout << "평균 AoI : " << m_AoI.size() << " ns, 샘플 수 : " << avg << "\n";
+
+  // 최고치(Peak)
+  auto peak = *std::max_element(m_AoI.begin(), m_AoI.end());
+  std::cout << "Peak AoI : " << peak << " ns\n";
+
+  // 상위 5% (95 백분위)
+  std::vector<uint64_t> sortedAoI = m_AoI;
+  std::sort(sortedAoI.begin(), sortedAoI.end());
+  size_t idx95 = static_cast<size_t>(0.95 * sortedAoI.size());
+  if (idx95 >= sortedAoI.size()) idx95 = sortedAoI.size() - 1;
+  auto p95 = sortedAoI[idx95];
+  std::cout << "상위 5% AoI : " << p95 << " ns\n";
 }
 
 NrGnbPhySapUser*
@@ -1198,12 +1378,34 @@ NrGnbMac::DoSchedConfigIndication (NrMacSchedSapUser::SchedConfigIndParameters i
 
   SendRar (ind.m_buildRarList);
 
-  for (unsigned islot = 0; islot < ind.m_slotAllocInfo.m_varTtiAllocInfo.size (); islot++)
-    {
-      VarTtiAllocInfo &varTtiAllocInfo = ind.m_slotAllocInfo.m_varTtiAllocInfo[islot];
-      if (varTtiAllocInfo.m_dci->m_type != DciInfoElementTdma::CTRL
-          && varTtiAllocInfo.m_dci->m_format == DciInfoElementTdma::DL)
-        {
+  for (unsigned islot = 0; islot < ind.m_slotAllocInfo.m_varTtiAllocInfo.size (); islot++) {
+    VarTtiAllocInfo &varTtiAllocInfo = ind.m_slotAllocInfo.m_varTtiAllocInfo[islot];
+
+    uint16_t rnti = varTtiAllocInfo.m_dci->m_rnti;
+
+    auto& ageQueue = m_AgeQueues[rnti];
+    if (!ageQueue.empty()){
+      AgeEntry &entry = ageQueue.front();
+
+      uint64_t aoi = entry.age;                      // AoI 계산
+
+      // 스케줄러에 Age 값을 전달하여 우선순위 결정에 반영
+      varTtiAllocInfo.m_age = aoi;
+
+      // AoI 값을 로그로 출력
+      // NS_LOG_INFO("UE " << rnti << " \tAoI 값 = " << varTtiAllocInfo.m_age << " \t 스케줄링된 후 시점");
+      if (rnti < 5){
+        NS_LOG_INFO(rnti);
+      }
+      ageQueue.pop(); // 처리 완료 후 제거
+      
+      m_AoI.push_back(aoi);  // 스케줄링된 Aoi 값을 벡터에 추가
+    }
+    else{
+      varTtiAllocInfo.m_age = 1;  // Age 정보가 없으면 기본값 1
+    }
+
+    if (varTtiAllocInfo.m_dci->m_type != DciInfoElementTdma::CTRL && varTtiAllocInfo.m_dci->m_format == DciInfoElementTdma::DL) {
           uint16_t rnti = varTtiAllocInfo.m_dci->m_rnti;
           auto rntiIt = m_rlcAttached.find (rnti);
           NS_ABORT_MSG_IF(rntiIt == m_rlcAttached.end (),
@@ -1282,59 +1484,62 @@ NrGnbMac::DoSchedConfigIndication (NrMacSchedSapUser::SchedConfigIndParameters i
                 }
             }
 
-          if (mapRet.second)
-            {
-              m_macPduMap.erase (mapRet.first);    // delete map entry
-            }
+      if (mapRet.second) {
+        m_macPduMap.erase (mapRet.first);    // delete map entry
+      }
 
-          for (uint8_t stream = 0; stream < dciElem->m_tbSize.size (); stream++)
-            {
-              NrSchedulingCallbackInfo traceInfo;
-              traceInfo.m_frameNum = ind.m_sfnSf.GetFrame ();
-              traceInfo.m_subframeNum = ind.m_sfnSf.GetSubframe ();
-              traceInfo.m_slotNum = ind.m_sfnSf.GetSlot ();
-              traceInfo.m_symStart = dciElem->m_symStart;
-              traceInfo.m_numSym = dciElem->m_numSym;
-              traceInfo.m_streamId = stream;
-              traceInfo.m_tbSize = dciElem->m_tbSize.at (stream);
-              traceInfo.m_mcs = dciElem->m_mcs.at (stream);
-              traceInfo.m_rnti = dciElem->m_rnti;
-              traceInfo.m_bwpId = GetBwpId ();
-              traceInfo.m_ndi = dciElem->m_ndi.at (stream);
-              traceInfo.m_rv = dciElem->m_rv.at (stream);
-              traceInfo.m_harqId = dciElem->m_harqProcess;
+      for (uint8_t stream = 0; stream < dciElem->m_tbSize.size (); stream++) {
+        NrSchedulingCallbackInfo traceInfo;
+        traceInfo.m_frameNum = ind.m_sfnSf.GetFrame ();
+        traceInfo.m_subframeNum = ind.m_sfnSf.GetSubframe ();
+        traceInfo.m_slotNum = ind.m_sfnSf.GetSlot ();
+        traceInfo.m_symStart = dciElem->m_symStart;
+        traceInfo.m_numSym = dciElem->m_numSym;
+        traceInfo.m_streamId = stream;
+        traceInfo.m_tbSize = dciElem->m_tbSize.at (stream);
+        traceInfo.m_mcs = dciElem->m_mcs.at (stream);
+        traceInfo.m_rnti = dciElem->m_rnti;
+        traceInfo.m_bwpId = GetBwpId ();
+        traceInfo.m_ndi = dciElem->m_ndi.at (stream);
+        traceInfo.m_rv = dciElem->m_rv.at (stream);
+        traceInfo.m_harqId = dciElem->m_harqProcess;
 
-              m_dlScheduling (traceInfo);
-            }
-        }
-      else if (varTtiAllocInfo.m_dci->m_type != DciInfoElementTdma::CTRL
+        m_dlScheduling (traceInfo);
+      }
+    }
+    else if (varTtiAllocInfo.m_dci->m_type != DciInfoElementTdma::CTRL
                && varTtiAllocInfo.m_dci->m_type != DciInfoElementTdma::SRS
-               && varTtiAllocInfo.m_dci->m_format == DciInfoElementTdma::UL)
-        {
+               && varTtiAllocInfo.m_dci->m_format == DciInfoElementTdma::UL) {
           //UL scheduling info trace
           // Call RLC entities to generate RLC PDUs
-          auto dciElem = varTtiAllocInfo.m_dci;
-          for (uint8_t stream = 0; stream < dciElem->m_tbSize.size (); stream++)
-            {
-              NrSchedulingCallbackInfo traceInfo;
-              traceInfo.m_frameNum = ind.m_sfnSf.GetFrame ();
-              traceInfo.m_subframeNum = ind.m_sfnSf.GetSubframe ();
-              traceInfo.m_slotNum = ind.m_sfnSf.GetSlot ();
-              traceInfo.m_symStart = dciElem->m_symStart;
-              traceInfo.m_numSym = dciElem->m_numSym;
-              traceInfo.m_streamId = stream;
-              traceInfo.m_tbSize = dciElem->m_tbSize.at (stream);
-              traceInfo.m_mcs = dciElem->m_mcs.at (stream);
-              traceInfo.m_rnti = dciElem->m_rnti;
-              traceInfo.m_bwpId = GetBwpId ();
-              traceInfo.m_ndi = dciElem->m_ndi.at (stream);
-              traceInfo.m_rv = dciElem->m_rv.at (stream);
-              traceInfo.m_harqId = dciElem->m_harqProcess;
+      auto dciElem = varTtiAllocInfo.m_dci;
+    for (uint8_t stream = 0; stream < dciElem->m_tbSize.size (); stream++) {
+        NrSchedulingCallbackInfo traceInfo;
+        traceInfo.m_frameNum = ind.m_sfnSf.GetFrame ();
+        traceInfo.m_subframeNum = ind.m_sfnSf.GetSubframe ();
+        traceInfo.m_slotNum = ind.m_sfnSf.GetSlot ();
+        traceInfo.m_symStart = dciElem->m_symStart;
+        traceInfo.m_numSym = dciElem->m_numSym;
+        traceInfo.m_streamId = stream;
+        traceInfo.m_tbSize = dciElem->m_tbSize.at (stream);
+        traceInfo.m_mcs = dciElem->m_mcs.at (stream);
+        traceInfo.m_rnti = dciElem->m_rnti;
+        traceInfo.m_bwpId = GetBwpId ();
+        traceInfo.m_ndi = dciElem->m_ndi.at (stream);
+        traceInfo.m_rv = dciElem->m_rv.at (stream);
+        traceInfo.m_harqId = dciElem->m_harqProcess;
 
-              m_ulScheduling (traceInfo);
-            }
-        }
+        m_ulScheduling (traceInfo);
+      }
     }
+  }
+  // 스케줄링 후 평균 Age 계산
+  // if (!m_AoI.empty())
+  // {
+  //   uint64_t sumAge = std::accumulate(m_AoI.begin(), m_AoI.end(), uint64_t(0));
+  //   uint64_t avgAge = sumAge / m_AoI.size();
+  //   NS_LOG_INFO("\n스케줄링 후 평균 Age 값 : " << avgAge);
+  // }
 
 }
 

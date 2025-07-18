@@ -81,6 +81,10 @@ public:
    */
   virtual ~NrMacSchedulerUeInfo ();
 
+  uint16_t GetRnti () const
+  {
+    return m_rnti;
+  }
   /**
    * \brief GetDlRBG
    * \param ue UE pointer from which obtain the value

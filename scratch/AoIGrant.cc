@@ -133,6 +133,8 @@ MyModel::Setup (Ptr<NetDevice> device, Address address, uint32_t packetSize, uin
   m_deadline = deadline;
 }
 
+static std::vector<Ptr<MyModel>> ueModels;
+
 /*
  * 하향링크(DL) 트래픽에 대해 실행되는 첫 번째 이벤트입니다. 
  */
@@ -197,10 +199,14 @@ MyModel::SendPacketUl () {
   // 패킷 생성
   Ptr<Packet> pkt = Create<Packet> (m_packetSize, m_periodicity, m_deadline);
 
-  uint64_t creationTime = Simulator::Now().GetMicroSeconds(); // 패킷 생성 시간(μs)
+  uint64_t creationTime = Simulator::Now().GetNanoSeconds(); // 패킷 생성 시간(μs)
   PacketCreationTimeTag creationTimeTag(creationTime);
   pkt->AddPacketTag(creationTimeTag);                         // 패킷에 태그를 통해서 생성 시간 삽입
-  std::cout << "\n패킷 생성 시간:" << creationTime << "μs\n" << std::endl;
+  std::cout << "\n패킷 생성 시간:" << creationTime << "ns\n" << std::endl;
+
+  uint32_t Priorty = (std::rand() % 8 + 1);                   // 우선순위를 무작위로 1 ~ 8 결정
+  PriorityTag PriortyTag(Priorty);
+  pkt->AddPacketTag(PriortyTag); 
 
   Ipv4Header ipv4Header;
   ipv4Header.SetProtocol(Ipv4L3Protocol::PROT_NUMBER);
@@ -260,60 +266,72 @@ void ConnectUlPdcpRlcTraces () {
 /************************************************************ << main >> ************************************************************/
 int
 main (int argc, char *argv[]) {
-    uint16_t numerologyBwp1 = 1;            // 뉴머롤로지 : 대역폭 부분에서 사용할 서브캐리어 간격 설정
-    uint32_t packetSize = 10;               // 패킷 크기 Byte
-    double centralFrequencyBand1 = 3550e6;  // 주파수 3550 MHz
-    double bandwidthBand1 = 20e6;           // 대역폭 20 MHz
-    uint32_t init = 100000;                 // 초기 지연 시간 μs
-    uint8_t period = uint8_t(10);           // 생성주기 ms
-    uint32_t deadline = 10000000;           // 마감 시간 μs
-    uint16_t TTI = 100;                     // Age Update TTI(µs)
+  uint16_t numerologyBwp1 = 1;            // 뉴머롤로지 : 대역폭 부분에서 사용할 서브캐리어 간격 설정
+  uint32_t packetSize = 1000;             // 패킷 크기 Byte
+  double centralFrequencyBand1 = 3550e6;  // 주파수 3550 MHz
+  double bandwidthBand1 = 20e6;           // 대역폭 20 MHz
+  uint32_t init = 100000;                 // 초기 지연 시간 μs
+  uint8_t period = uint8_t(10);           // 생성주기 ms
+  uint32_t deadline = 100000000;          // 마감 시간 (100ms를 ns로 표시)
+  uint16_t TTI = 100;                     // Age Update TTI(ns)
 
-    uint16_t gNbNum = 1;                    // 기지국 수
-    uint16_t ueNumPergNb = 15;              // 단말 수
+  uint16_t gNbNum = 1;                    // 기지국 수
+  uint16_t ueNumPergNb = 6;              // 단말 수
 
-    bool enableUl = true;                   // 상향 트래픽
-    uint32_t nPackets = 0;                  // 패킷 총 개수(0 이면 풀버퍼, 아니면 설정된 개수)
-    Time sendPacketTime = Seconds(0);       // 패킷 전송 시작 전에 대기하는 시간, 패킷 전송 지연 시간
-    uint8_t sch = 1;                        // 스케줄러 타입 (0: TDMA /1: OFDMA /2: Sym-OFDMA /3: RB-OFDMA)
-                                            // Sym-OFDMA : 각 UE에 필요한 최소한의 OFDM 심볼을 할당
-                                            // RB-OFDMA : 주어진 주파수 자원을 최대한 많은 UE가 공유
-    uint8_t SchedulerChoice = 1;            // 스케줄러 선택 (0: RR / 1: PF / 2: AG(AgeGreedy))
-    bool AoI_Type = false;                  // F : 1유형 / T : 2유형
-    bool random_seed = false;               // 랜덤 시드
+  bool enableUl = true;                   // 상향 트래픽
+  uint32_t nPackets = 0;                  // 패킷 총 개수(0 이면 풀버퍼, 아니면 설정된 개수)
+  Time sendPacketTime = Seconds(0);       // 패킷 전송 시작 전에 대기하는 시간, 패킷 전송 지연 시간
+  uint8_t sch = 1;                        // 스케줄러 타입 (0: TDMA /1: OFDMA /2: Sym-OFDMA /3: RB-OFDMA)
+                                          // Sym-OFDMA : 각 UE에 필요한 최소한의 OFDM 심볼을 할당
+                                          // RB-OFDMA : 주어진 주파수 자원을 최대한 많은 UE가 공유
+  uint8_t SchedulerChoice = 2;            // 스케줄러 선택 (0: RR / 1: PF / 2: AG(AgeGreedy))
+  /* AoI 유형을 바꾸는 코드
+   * F : 1유형(gnb 수신시간 - UE 생성시간)
+   * T : 2유형(각 UE마다 Age를 TTI 마다 1씩 증가하여 관리)
+   */
+  bool AoI_Type = true;
+  bool random_seed = false;               // 랜덤 시드
 
-    // 고정 시드 : 42(*), 537(V), 1858(V), 3022(V), 3108(V), 4472(V), 4485(V), 5854(V), 8623(V), 9391(V)
-    if (random_seed == false){
-        u_int32_t seed = 42;
-        std::srand(seed);
-    }
-    else {
-        u_int32_t seed = static_cast<u_int32_t>(time(nullptr));
-        std::srand(seed);
-    }
+  /*************************************** 스케줄러 유형 선택 ******************************************
+   * configured grant <-> grant based
+   * true -> configured grant
+   * false -> grant based
+   ****************************************************************************************************/
+  bool scheduler_CG = false;
+  uint8_t configurationTime = 60;
 
-    // 최대 N개의 UE까지 등록가능 Allowed values: 2 5 10 20 40 80 160 320
-    // Config::SetDefault ("ns3::NrGnbRrc::SrsPeriodicity", UintegerValue (80));
-    delay = MicroSeconds(10);                 // 트래픽에 적용할 지연 시간(딜레이)을 설정
+  // 고정 시드 : 42(*), 537(V), 1858(V), 3022(V), 3108(V), 4472(V), 4485(V), 5854(V), 8623(V), 9391(V)
+  if (random_seed == false){
+    u_int32_t seed = 42;
+    std::srand(seed);
+  }
+  else {
+    u_int32_t seed = static_cast<u_int32_t>(time(nullptr));
+    std::srand(seed);
+  }
 
-    CommandLine cmd;
-    cmd.AddValue ("numerologyBwp1", "The numerology to be used in bandwidth part 1", numerologyBwp1);
-    cmd.AddValue ("centralFrequencyBand1", "The system frequency to be used in band 1", centralFrequencyBand1);
-    cmd.AddValue ("bandwidthBand1", "The system bandwidth to be used in band 1", bandwidthBand1);
-    cmd.AddValue ("packetSize", "packet size in bytes", packetSize);
-    cmd.AddValue ("enableUl", "Enable Uplink", enableUl);
-    cmd.AddValue ("scheduler", "Scheduler", sch);
-    cmd.Parse (argc, argv);
+  // 최대 N개의 UE까지 등록가능 Allowed values: 2 5 10 20 40 80 160 320
+  // Config::SetDefault ("ns3::NrGnbRrc::SrsPeriodicity", UintegerValue (80));
+  delay = MicroSeconds(10);                 // 트래픽에 적용할 지연 시간(딜레이)을 설정
+
+  CommandLine cmd;
+  cmd.AddValue ("numerologyBwp1", "The numerology to be used in bandwidth part 1", numerologyBwp1);
+  cmd.AddValue ("centralFrequencyBand1", "The system frequency to be used in band 1", centralFrequencyBand1);
+  cmd.AddValue ("bandwidthBand1", "The system bandwidth to be used in band 1", bandwidthBand1);
+  cmd.AddValue ("packetSize", "packet size in bytes", packetSize);
+  cmd.AddValue ("enableUl", "Enable Uplink", enableUl);
+  cmd.AddValue ("scheduler", "Scheduler", sch);
+  cmd.Parse (argc, argv);
 
     /*********************************************************< Age가 넘어가는 경로의 gNB, Scheduler NS3 LOG INFO >******************************************************/
     
     LogComponentEnable("AoIGrant", LOG_INFO);
     LogComponentEnable("NrGnbMac", LOG_INFO);
     // LogComponentEnable("NrGnbPhy", LOG_INFO);
-    LogComponentEnable("NrUeMac", LOG_INFO);
-    //LogComponentEnable("NrMacSchedulerNs3", LOG_INFO);
+    // LogComponentEnable("NrUeMac", LOG_INFO);
+    // LogComponentEnable("NrMacSchedulerNs3", LOG_INFO);
     // LogComponentEnable("NrMacSchedulerTdma", LOG_INFO);
-    LogComponentEnable("NrMacSchedulerOfdma", LOG_INFO);
+    // LogComponentEnable("NrMacSchedulerOfdma", LOG_INFO);
 
     /*******************************************************************************************************************************************************************/
 
@@ -376,14 +394,6 @@ main (int argc, char *argv[]) {
     Ptr<NrHelper> nrHelper = CreateObject<NrHelper> ();
     nrHelper->SetBeamformingHelper (idealBeamformingHelper);
 
-    /*************************************** 스케줄러 유형 선택 ******************************************
-     * configured grant <-> grant based
-     * true -> configured grant
-     * false -> grant based
-     ****************************************************************************************************/
-    bool scheduler_CG = true;
-    uint8_t configurationTime = 60;
-
     nrHelper->SetUeMacAttribute ("CG", BooleanValue (scheduler_CG));
     nrHelper->SetUePhyAttribute ("CG", BooleanValue (scheduler_CG));
     nrHelper->SetGnbMacAttribute ("CG", BooleanValue (scheduler_CG));
@@ -406,6 +416,7 @@ main (int argc, char *argv[]) {
 
     // SRS 과정 비활성화
     nrHelper->SetSchedulerAttribute ("SrsSymbols", UintegerValue (0));
+    // nrHelper->SetSchedulerAttribute("UlCtrlSymbols", UintegerValue(0));
 
     // 원하는 유연한 패턴을 추가합니다.(필요한 하향링크(DL) 데이터 symbols (기본값 0))
     nrHelper->SetSchedulerAttribute ("DlDataSymbolsFpattern", UintegerValue (0)); //symStart - 1
@@ -413,6 +424,23 @@ main (int argc, char *argv[]) {
     // HARQ 재전송 활성화 또는 비활성화
     nrHelper->SetSchedulerAttribute ("EnableHarqReTx", BooleanValue (false));   // 기본 값 false
     Config::SetDefault ("ns3::NrHelper::HarqEnabled", BooleanValue (false));  // 기본 값 false 
+
+    // 모드 출력
+    std::cout << "\nGrant 모드 : ";
+    if (scheduler_CG) {
+      std::cout << "Configured Grant(사전 구성)" << std::endl;
+    }
+    else {
+      std::cout << "Grant Based(구성 기반)" << std::endl;
+    }
+
+    std::cout << "\nAoI 모드 : ";
+    if (AoI_Type) {
+      std::cout << "Type 2(True, gNB가 UE의 AoI를 TTI 마다 관리)" << std::endl;
+    }
+    else {
+      std::cout << "Type 1(False, gNB 수신시간 - UE 생성시간)" << std::endl;
+    }
 
     // 스케줄러 선택
     if (sch != 0) {
@@ -537,33 +565,26 @@ main (int argc, char *argv[]) {
     // gNB의 MAC 객체에 대한 포인터를 얻습니다.
     gnbMacPtr = DynamicCast<NrGnbMac>(enbNetDev.Get(0)->GetObject<NrGnbNetDevice>()->GetMac(0));
 
+    gnbMacPtr -> SetAoIType(AoI_Type);
 
-    // UL traffic
-    std::vector <Ptr<MyModel>> v_modelUl;
-    v_modelUl = std::vector<Ptr<MyModel>> (ueNumPergNb,{0});
-    for (uint8_t ii=0; ii<ueNumPergNb; ++ii)
-    {
-        Ptr<MyModel> modelUl = CreateObject<MyModel> ();
-        modelUl -> Setup(ueNetDev.Get(ii), enbNetDev.Get(0)->GetAddress(), v_packet[ii], nPackets, DataRate("1Mbps"),v_period[ii], v_deadline[ii]);
-        v_modelUl[ii] = modelUl;
-        Simulator::Schedule(MicroSeconds(v_init[ii]), &StartApplicationUl, v_modelUl[ii]);
-    }
+    // 하향링크(DL) 트래픽
+    // Ptr<MyModel> modelDl = CreateObject<MyModel> ();
+    // modelDl -> Setup(enbNetDev.Get(0), ueNetDev.Get(0)->GetAddress(), 10, nPackets, DataRate("1Mbps"),20, uint32_t(100000));
+    // Simulator::Schedule(MicroSeconds(0.099625), &StartApplicationDl, modelDl);
 
-    // DL traffic
-    //Ptr<MyModel> modelDl = CreateObject<MyModel> ();
-    //modelDl -> Setup(enbNetDev.Get(0), ueNetDev.Get(0)->GetAddress(), 10, nPackets, DataRate("1Mbps"),20, uint32_t(100000));
-    //Simulator::Schedule(MicroSeconds(0.099625), &StartApplicationDl, modelDl);
     // 상향링크(UL) 트래픽
-    // ueModels.reserve(ueNumPergNb);
+    ueModels.reserve(ueNumPergNb);
     for (uint32_t i = 0; i < ueNumPergNb; ++i) {
         Ptr<MyModel> UE = CreateObject<MyModel>();
         UE->Setup(ueNetDev.Get (i), enbNetDev.Get (0)->GetAddress (), packetSize, nPackets, DataRate ("1Mbps"), period, deadline);
+        ueModels.push_back(UE);
         Simulator::Schedule (MicroSeconds(v_init[i]), &StartApplicationUl, UE);
     }
 
     if (AoI_Type == true) {
       gnbMacPtr->StartPeriodicAgeUpdate(TTI, deadline);  // Age 계산 주기적 호출 시작 추가
     }
+    
     Simulator::Schedule (Seconds (0.16), &ConnectUlPdcpRlcTraces);
     Simulator::Stop (Seconds (30.0));
 

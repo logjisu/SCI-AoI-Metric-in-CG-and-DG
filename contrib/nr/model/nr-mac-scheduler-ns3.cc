@@ -39,10 +39,14 @@
 #include <ns3/integer.h>
 #include <unordered_set>
 
+#include <queue>
+
 namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE ("NrMacSchedulerNs3");
 NS_OBJECT_ENSURE_REGISTERED (NrMacSchedulerNs3);
+
+std::map<uint16_t, uint64_t> UeAgeMap;
 
 NrMacSchedulerNs3::NrMacSchedulerNs3 () : NrMacScheduler ()
 {
@@ -2648,14 +2652,21 @@ NrMacSchedulerNs3::DoSchedUlCgrInfoReq (const NrMacSchedSapProvider::SchedUlCgrI
   NS_LOG_FUNCTION (this);
 
   // Merge RNTI in our current list
-  for (const auto & ue : params.m_srList)
+  for (size_t i = 0; i < params.m_srList.size(); ++i)   //const auto & ue : params.m_srList
     {
+      auto ue = params.m_srList[i];
       NS_LOG_INFO ("UE " << ue << " asked for a CGR ");
-      auto it = std::find (m_srList.begin(), m_srList.end(), ue);
-      if (it == m_srList.end())
-        {
-          m_srList.push_back (ue);
-        }
+
+      // UE가 리스트에 없다면 추가
+      if (std::find(m_srList.begin(), m_srList.end(), ue) == m_srList.end())
+      {
+        m_srList.push_back(ue);
+      }
+      // 각 UE에 해당하는 Age 값 저장
+      if (i < params.m_ageList.size()) // ageList와 크기 일치 여부 확인
+      {
+        SetAge(ue, params.m_ageList[i]);
+      }
     }
 
   for (const auto & buf : params.m_bufCgr)
@@ -2669,6 +2680,21 @@ NrMacSchedulerNs3::DoSchedUlCgrInfoReq (const NrMacSchedSapProvider::SchedUlCgrI
   //m_cgrBufSize = params.m_bufCgr;
   m_lcid_configuredGrant = params.lcid;
   NS_ASSERT (m_srList.size () >= params.m_srList.size ());
+}
+
+void NrMacSchedulerNs3::SetAge(uint16_t ueRnti, uint64_t age)
+{
+  UeAgeMap[ueRnti] = age;
+}
+
+uint64_t NrMacSchedulerNs3::GetAge(uint16_t ueRnti) const
+{
+  auto it = UeAgeMap.find(ueRnti);
+  if (it != UeAgeMap.end())
+  {
+    return it->second; // 특정 UE의 Age 값 반환
+  }
+  return 0;
 }
 
 bool

@@ -38,6 +38,7 @@ namespace ns3 {
 class NrControlMessage;
 class NrRarMessage;
 class BeamConfId;
+extern std::unordered_map<uint16_t, uint64_t> m_패킷생성시간; // RNTI와 패킷 생성 시간을 저장할 맵
 
 /**
  * \ingroup gnb-mac
@@ -83,6 +84,20 @@ public:
    * \brief ~NrGnbMac
    */
   virtual ~NrGnbMac (void) override;
+
+  bool m_AoIType;
+  void SetAoIType(bool type) {
+    m_AoIType = type;
+  };
+  void StartPeriodicAgeUpdate(uint16_t tti, uint32_t deadline);
+  void IncrementAgeOnNoPacket(uint16_t rnti, uint32_t deadline);
+  void ResetAgeOnPacketProcessed(uint16_t rnti);
+  void PeriodicAgeUpdate(uint16_t tti, uint32_t deadline);
+  struct AgeEntry {
+    uint32_t priority;
+    uint64_t age;
+    uint32_t count;
+  };
 
   /**
    * \brief Sets the number of RBs per RBG. Currently it can be 
@@ -170,7 +185,10 @@ public:
 
   void SetEnbCmacSapUser (LteEnbCmacSapUser* s);
 
-
+  void PrintAverageThroughput ();
+  void PrintAverageAoI ();
+  void DoAddUe (uint16_t rnti);
+  void DoRemoveUe (uint16_t rnti);
 
   /**
   * \brief Get the gNB-ComponentCarrierManager SAP User
@@ -314,8 +332,8 @@ private:
   void DoCschedCellConfigUpdateInd (NrMacCschedSapUser::CschedCellConfigUpdateIndParameters params);
   // forwarded from LteEnbCmacSapProvider
   void DoConfigureMac (uint16_t ulBandwidth, uint16_t dlBandwidth);
-  void DoAddUe (uint16_t rnti);
-  void DoRemoveUe (uint16_t rnti);
+  // void DoAddUe (uint16_t rnti);
+  // void DoRemoveUe (uint16_t rnti);
   void DoAddLc (LteEnbCmacSapProvider::LcInfo lcinfo, LteMacSapUser* msu);
   void DoReconfigureLc (LteEnbCmacSapProvider::LcInfo lcinfo);
   void DoReleaseLc (uint16_t  rnti, uint8_t lcid);
@@ -444,6 +462,7 @@ private:
   std::list<Time> m_cgrTraffDeadline;
   SfnSf m_cgrNextTxSlot;
   uint8_t countCG_slots = 0 ;
+  uint64_t CalculateAgeForRnti(uint16_t rnti);  // Age 계산 함수 선언
 };
 
 }

@@ -297,7 +297,7 @@ struct VarTtiAllocInfo
     : m_dci (dci)
   {
   }
-
+  uint64_t m_age;  // Age 값을 저장할 필드 추가
   bool m_isOmni           {false};
   std::shared_ptr<DciInfoElementTdma> m_dci;
   std::vector<std::vector<RlcPduInfo> > m_rlcPduInfo;
